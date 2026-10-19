@@ -1,0 +1,51 @@
+name: Actualizar el café de la actualidad
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '10 5,6 * * *'
+permissions:
+  contents: write
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Comprobar hora española
+        id: hora
+        env:
+          EVENTO: ${{ github.event_name }}
+        run: |
+          python - <<'PY'
+          import os,datetime
+          from zoneinfo import ZoneInfo
+          now=datetime.datetime.now(ZoneInfo('Europe/Madrid'))
+          ok=os.environ['EVENTO']=='workflow_dispatch' or (now.hour==7 and now.minute<=35)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write(f'run={str(ok).lower()}\n')
+          print('Hora de Madrid:',now,'Ejecutar:',ok)
+          PY
+      - name: Generar edición
+        if: steps.hora.outputs.run == 'true'
+        run: python generar_periodico.py
+      - name: Instalar voz
+        if: steps.hora.outputs.run == 'true'
+        run: python -m pip install edge-tts
+      - name: Crear MP3 y añadir reproductor
+        if: steps.hora.outputs.run == 'true'
+        run: |
+          if ! python crear_audio.py; then
+            echo 'No se pudo generar audio: se publica la edición solo con texto.'
+            rm -f periodico.mp3
+          fi
+      - name: Publicar edición
+        if: steps.hora.outputs.run == 'true'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A index.html periodico.mp3
+          if ! git diff --cached --quiet; then
+            git commit -m 'Actualización diaria del periódico y audio'
+            git push
+          fi
