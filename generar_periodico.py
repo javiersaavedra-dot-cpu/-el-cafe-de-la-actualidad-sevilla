@@ -4,7 +4,10 @@ import datetime as dt
 import email.utils
 import html
 import json
+from html.parser import HTMLParser
 import re
+import unicodedata
+from urllib.parse import quote, urlparse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -13,29 +16,46 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo('Europe/Madrid')
 NOW = dt.datetime.now(TZ)
 WEEKEND = NOW.weekday() >= 5
-LIMIT = 24 if WEEKEND else 18
+BASE_LIMIT = 24 if WEEKEND else 18
+LIMIT = BASE_LIMIT + 1  # Una plaza adicional solo si hay noticia reciente de cofradías
 
 # RSS públicos: algunos medios cambian sus direcciones o bloquean las peticiones.
 # Un feed que falle no impide generar el periódico con el resto.
+def google_news(query):
+    """RSS público de Google Noticias, sin claves ni servicios de pago."""
+    return ('https://news.google.com/rss/search?q=' + quote(query)
+            + '&hl=es&gl=ES&ceid=ES%3Aes')
+
+# Los canales directos fallidos de RTVE/SINC/medios locales se sustituyen
+# provisionalmente por búsquedas por dominio. No se presupone que estén activos.
 FEEDS = [
+    # Pocos medios: priorizar RSS directos con texto e imagen cuando existan.
+    ('elDiario.es RSS', 'España', 'https://www.eldiario.es/rss/'),
+    ('BBC Mundo', 'Internacional', 'https://feeds.bbci.co.uk/mundo/rss.xml'),
+    ('DW RSS', 'Internacional', 'https://rss.dw.com/rdf/rss-sp-all'),
+    ('Euronews RSS', 'Internacional', 'https://es.euronews.com/rss'),
+    ('France 24 RSS', 'Internacional', 'https://www.france24.com/es/rss'),
+    ('20 Minutos', 'Sociedad', 'https://www.20minutos.es/rss/'),
+    ('Xataka', 'Ciencia', 'https://www.xataka.com/index.xml'),
+    # Estos RSS pueden fallar; si lo hacen, se omiten sin interrumpir la edición.
     ('RTVE España', 'España', 'https://www.rtve.es/rss/temas_noticias.xml'),
     ('RTVE Internacional', 'Internacional', 'https://www.rtve.es/rss/temas_internacional.xml'),
     ('RTVE Sociedad', 'Sociedad', 'https://www.rtve.es/rss/temas_sociedad.xml'),
     ('RTVE Cultura', 'Cultura', 'https://www.rtve.es/rss/temas_cultura.xml'),
     ('RTVE Deportes', 'Deportes', 'https://www.rtve.es/rss/temas_deportes.xml'),
     ('RTVE Ciencia', 'Ciencia', 'https://www.rtve.es/rss/temas_ciencia.xml'),
-    ('RTVE Tecnología', 'Ciencia', 'https://www.rtve.es/rss/temas_tecnologia.xml'),
-    ('El País portada', 'España', 'https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/portada'),
-    ('El País Internacional', 'Internacional', 'https://feeds.elpais.com/mrss-s/pages/ep/site/elpais.com/section/internacional/portada'),
-    ('BBC Mundo', 'Internacional', 'https://feeds.bbci.co.uk/mundo/rss.xml'),
-    ('20 Minutos', 'Sociedad', 'https://www.20minutos.es/rss/'),
-    ('Xataka', 'Ciencia', 'https://www.xataka.com/index.xml'),
     ('SINC', 'Ciencia', 'https://www.agenciasinc.es/rss'),
-    ('Diario de Sevilla', 'Local', 'https://news.google.com/rss/search?q=site%3Adiariodesevilla.es%20Sevilla%20when%3A3d&hl=es&gl=ES&ceid=ES%3Aes'),
-    ('ABC de Sevilla', 'Local', 'https://news.google.com/rss/search?q=site%3Asevilla.abc.es%20Sevilla%20when%3A3d&hl=es&gl=ES&ceid=ES%3Aes'),
-    ('Europa Press Andalucía', 'Local', 'https://news.google.com/rss/search?q=site%3Aeuropapress.es/andalucia/sevilla%20Sevilla%20when%3A3d&hl=es&gl=ES&ceid=ES%3Aes'),
-    ('RTVE Andalucía', 'Local', 'https://news.google.com/rss/search?q=site%3Artve.es/noticias/andalucia%20Sevilla%20when%3A3d&hl=es&gl=ES&ceid=ES%3Aes'),
+    ('Diario de Sevilla', 'Local', google_news('site:diariodesevilla.es Sevilla when:3d')),
+    ('ABC de Sevilla', 'Local', google_news('site:sevilla.abc.es Sevilla when:3d')),
+    ('Europa Press Sevilla', 'Local', google_news('site:europapress.es/andalucia/sevilla Sevilla when:3d')),
+    ('RTVE Andalucía', 'Local', google_news('site:rtve.es/noticias/andalucia Sevilla when:3d')),
+    # Google Noticias solo como respaldo local y para cofradías; puede traer
+    # titulares sin resumen ni fotografía, que no pasarán el filtro editorial.
+    ('Sevilla Actualidad', 'Local', google_news('site:sevillaactualidad.com Sevilla when:3d')),
+    ('Cofradías Sevilla · Google Noticias', 'Cofradías',
+     google_news('(cofradías OR hermandades OR procesiones OR semana santa) Sevilla when:3d')),
 ]
+
 NS = {
     'media': 'http://search.yahoo.com/mrss/',
     'content': 'http://purl.org/rss/1.0/modules/content/',
@@ -64,29 +84,219 @@ def first_text(item, tags):
     return ''
 
 def image_url(item):
+    """Busca imágenes RSS y también las insertadas en HTML de descripción."""
     for path in ('media:content', 'media:thumbnail', 'enclosure'):
         for el in item.findall(path, NS):
             url = el.attrib.get('url', '')
             kind = el.attrib.get('type', '')
-            if url.startswith('https://') and (path != 'enclosure' or kind.startswith('image/')):
+            if url.startswith('https://') and (path != 'enclosure' or
+                   kind.startswith('image/') or re.search(r'\.(?:jpe?g|png|webp)(?:\?|$)', url, re.I)):
                 return url
+    for tag in ('content:encoded', 'description', 'summary'):
+        raw = first_text(item, [tag])
+        match = re.search(r'<img\b[^>]*\bsrc=["\'](https://[^"\']+)', raw, re.I)
+        if match:
+            return html.unescape(match.group(1))
     return ''
 
-def classify(section, title, description):
-    """Reclasifica titulares evidentes; no inventa noticias ni su contenido."""
+def best_description(item, title):
+    """Elige la descripción útil más completa, no el primer campo del RSS."""
+    options = []
+    for tag in ('description', 'summary', 'atom:summary', 'content:encoded', 'atom:content'):
+        raw = first_text(item, [tag])
+        if raw:
+            candidate = valid_summary(title, raw)
+            if candidate:
+                options.append(candidate)
+    return max(options, key=len, default='')
+
+# La detección internacional se limita a titulares explícitos, para no convertir
+# en «Mundo» noticias españolas que mencionen un país de forma secundaria.
+INTERNATIONAL = re.compile(
+    r'\b(francia|francés|francesa|parís|alemania|berlín|italia|roma|reino unido|'
+    r'londres|portugal|lisboa|ucrania|rusia|moscú|estados unidos|ee\.?\s?uu\.?|'
+    r'washington|china|pekín|japón|tokio|israel|gaza|palestina|irán|irak|'
+    r'argentina|brasil|méxico|venezuela|colombia|chile|perú|canadá|'
+    r'bruselas|unión europea|otan)\b', re.I)
+COFRADIA_TERMS = re.compile(
+    r'cofrad[ií]a|hermandad|semana santa|procesi[oó]n|virgen de la alegr[ií]a|'
+    r'paso procesional|junta de semana santa|santo entierro|virgen de la soledad', re.I)
+SEVILLA_TERMS = re.compile(r'sevilla|sevillan[oa]s?|andaluc[ií]a', re.I)
+HERMANDADES_DESTACADAS = re.compile(r'(esperanza de triana|gran poder|macarena|cachorro|estudiantes|silencio|san benito)', re.I)
+
+def is_cofradia(title, description, source='', section=''):
+    text = title + ' ' + description[:400]
+    # Los medios locales identificados permiten reconocer advocaciones que
+    # no mencionan Sevilla en el propio titular (p. ej., Esperanza de Triana).
+    local_source = section == 'Local' and source in (
+        'Diario de Sevilla', 'ABC de Sevilla', 'Europa Press Sevilla', 'RTVE Andalucía', 'Sevilla Actualidad')
+    return bool(COFRADIA_TERMS.search(text) and
+                (SEVILLA_TERMS.search(text) or HERMANDADES_DESTACADAS.search(text)
+                 or local_source))
+
+def classify(section, title, description, source=''):
+    """Clasifica por contenido sin confundir la procedencia del RSS con el tema."""
     t = (title + ' ' + description[:180]).lower()
     science = ('investigación', 'científic', 'astronom', 'nasa', 'espacial',
                'descubrimient', 'universo', 'arqueolog', 'fósil', 'inteligencia artificial')
     culture = ('museo', 'exposición', 'literatura', 'novela', 'cine', 'teatro',
                'festival', 'concierto', 'patrimonio', 'historia del')
     local = ('sevilla', 'sevillano', 'sevillana', 'andalucía', 'andaluz', 'andaluza')
-    if section in ('España', 'Sociedad') and any(x in t for x in local):
+    if is_cofradia(title, description, source, section):
+        return 'Cofradías'
+    if section == 'Cofradías':
+        return 'Descartar'  # Evita noticias de cofradías ajenas a Sevilla.
+    if section in ('España', 'Sociedad') and any(x in title.lower() for x in local):
         return 'Local'
+    if section == 'España' and INTERNATIONAL.search(title) and not re.search(
+            r'\b(españa|español|española|madrid|gobierno español)\b', title, re.I):
+        return 'Internacional'
+    if section == 'Sociedad' and any(x in t for x in ('portero', 'futbolista', 'real madrid', 'fc barcelona', 'clásico', 'champions')):
+        return 'Deportes'
     if section in ('España', 'Sociedad') and any(x in t for x in science):
+        return 'Ciencia'
+    if section == 'Internacional' and any(x in t for x in ('salud cerebral', 'declive del cerebro', 'investigación científica')):
         return 'Ciencia'
     if section in ('España', 'Sociedad') and any(x in t for x in culture):
         return 'Cultura'
     return section
+
+# Los RSS agregados pueden añadir el nombre del medio al final del titular.
+# El medio ya aparece en la etiqueta de la tarjeta: no repetirlo ni leerlo en voz alta.
+def clean_title(title, source):
+    title = plain(title)
+    names = {source, source.replace(' · Google Noticias', ''),
+             'Diario de Sevilla', 'ABC de Sevilla', 'Sevilla Actualidad',
+             'El País', 'RTVE', '20 Minutos', 'BBC Mundo', 'Xataka', 'SINC',
+             'El Mundo', 'elDiario.es', 'El Confidencial', 'Europa Press',
+             'La Vanguardia', 'ABC', 'MARCA', 'AS', 'Mundo Deportivo',
+             'DW.com', 'Euronews.com', 'Europa Press Sevilla', 'RTVE Andalucía',
+             'Diario AS', 'Diario Público', 'Público', 'El Cultural', 'France 24'}
+    for name in sorted(names, key=len, reverse=True):
+        if not name:
+            continue
+        title = re.sub(r'\s+[-–—|]\s+' + re.escape(name) + r'\s*$', '', title, flags=re.I)
+    return title.strip()
+
+# Los textos se construyen solo con información disponible, sin inventar contexto.
+def tidy_summary(title, raw):
+    text = plain(raw)
+    text = re.sub(r'(?i)^(leer m[aá]s|seguir leyendo|actualizado):?\s*', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    title_words = normalize(title)
+    sentences = re.split(r'(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÜÑ0-9¿¡])', text)
+    kept = []
+    for sentence in sentences:
+        sentence = sentence.strip(' -·|')
+        if len(sentence) < 25:
+            continue
+        words = normalize(sentence)
+        overlap = len(words & title_words) / max(1, min(len(words), len(title_words)))
+        if overlap > .86 and len(sentence) < 175:
+            continue
+        if any(similar(sentence, old) for old in kept):
+            continue
+        kept.append(sentence)
+        if len(' '.join(kept)) >= 720:
+            break
+    result = ' '.join(kept).strip()
+    return result[:950].rsplit(' ', 1)[0] + '…' if len(result) > 950 else result
+
+class PageMetadata(HTMLParser):
+    """Extrae únicamente metadatos públicos, nunca inventa un resumen."""
+    def __init__(self):
+        super().__init__()
+        self.meta = {}
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != 'meta':
+            return
+        d = dict(attrs)
+        key = (d.get('property') or d.get('name') or '').lower()
+        if key in ('description', 'og:description', 'twitter:description',
+                   'og:image', 'twitter:image', 'og:title'):
+            self.meta.setdefault(key, plain(d.get('content', '')))
+
+def page_metadata(url):
+    """Consulta metadatos de la URL pública, sin eludir restricciones."""
+    try:
+        host = (urlparse(url).hostname or '').lower()
+        if not host or host.endswith('google.com') or host.endswith('news.google.com'):
+            return {}, url
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (compatible; CafeActualidad/4.0)'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            final_url = response.geturl()
+            if 'html' not in response.headers.get('Content-Type', '').lower():
+                return {}, final_url
+            raw = response.read(220_000).decode('utf-8', 'replace')
+        parser = PageMetadata()
+        parser.feed(raw)
+        return parser.meta, final_url
+    except Exception:
+        return {}, url
+
+def valid_summary(title, summary):
+    """Conserva textos sustanciales sin exigir repetición literal del titular."""
+    text = tidy_summary(title, summary)
+    if len(text) < 75 or len(normalize(text)) < 9:
+        return ''
+    if similar(title, text) and len(text) < len(title) * 1.45:
+        return ''
+    if re.search(r'(?i)(suscr[ií]bete|aceptar cookies|inicia sesi[oó]n|todos los derechos reservados)', text):
+        return ''
+    return text
+
+
+def quality_enrich(items):
+    """Evalúa contenido ANTES de elegir. Limita peticiones para no agotar Actions."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # Orden inicial: RSS con resumen y foto, después RSS con resumen, después el resto.
+    def prelim(it):
+        direct = 'news.google.com' not in urlparse(it['link']).netloc
+        return (int(direct), int(bool(valid_summary(it['title'], it['description']))),
+                int(bool(it['image'])), it['published'].timestamp())
+    # Preselección equilibrada por sección, no solo las noticias más recientes.
+    by_section = defaultdict(list)
+    for it in items:
+        if it['section'] != 'Descartar':
+            by_section[it['section']].append(it)
+    candidates = []
+    for section, pool in by_section.items():
+        pool.sort(key=prelim, reverse=True)
+        # Candidatos suficientes por sección; se evalúan solo unos pocos enlaces
+        # para evitar cientos de peticiones web y ejecuciones de muchos minutos.
+        candidates.extend(pool[:max(10, QUOTAS.get(section, 1) * 4)])
+    def process(it):
+        it = it.copy()
+        it['description'] = valid_summary(it['title'], it['description'])
+        # Solo consultar la web original; no confiar en descripciones de Google News.
+        if 'news.google.com' not in urlparse(it['link']).netloc and (not it['description'] or not it['image']):
+            meta, _ = page_metadata(it['link'])
+            if not it['description']:
+                for key in ('og:description', 'description', 'twitter:description'):
+                    candidate = valid_summary(it['title'], meta.get(key, ''))
+                    if candidate:
+                        it['description'] = candidate
+                        break
+            if not it['image']:
+                candidate = meta.get('og:image') or meta.get('twitter:image', '')
+                if candidate.startswith('https://'):
+                    it['image'] = candidate
+        it['quality'] = int(bool(it['description'])) * 4 + int(bool(it['image']))
+        return it
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(process, candidates))
+    counts = defaultdict(int)
+    for it in results:
+        counts[it['section']] += bool(it['description'])
+    print('=== CANDIDATAS CON CONTENIDO COMPROBADO ===')
+    for section in QUOTAS:
+        print(f'{section}: {counts[section]} candidatas con resumen')
+    # Excepción editorial: una noticia reciente sobre cofradías de Sevilla
+    # puede mostrarse con su titular y enlace aunque el RSS no dé resumen.
+    # Las demás secciones mantienen el filtro de resúmenes útiles.
+    return [it for it in results if it['description'] or it['section'] == 'Cofradías']
+
 
 def fetch(source, section, url):
     try:
@@ -97,12 +307,12 @@ def fetch(source, section, url):
         items = root.findall('.//item') or root.findall('.//atom:entry', NS)
         result = []
         for it in items[:45]:
-            title = plain(first_text(it, ['title', 'atom:title']))
+            title = clean_title(first_text(it, ['title', 'atom:title']), source)
             link = first_text(it, ['link'])
             if not link:
                 lk = it.find('atom:link', NS)
                 link = lk.attrib.get('href', '') if lk is not None else ''
-            description = plain(first_text(it, ['description', 'summary', 'atom:summary', 'content:encoded']))
+            description = best_description(it, title)
             published = first_text(it, ['pubDate', 'published', 'atom:updated', 'atom:published'])
             try:
                 when = email.utils.parsedate_to_datetime(published)
@@ -118,9 +328,12 @@ def fetch(source, section, url):
             max_age = 76 if WEEKEND else 52
             if not title or not link.startswith('https://') or not (NOW - dt.timedelta(hours=max_age) <= when <= NOW + dt.timedelta(hours=2)):
                 continue
-            result.append(dict(title=title, link=link, description=description[:650],
+            actual_section = classify(section, title, description, source)
+            if actual_section == 'Descartar':
+                continue
+            result.append(dict(title=title, link=link, description=description[:1200],
                                published=when, source=source,
-                               section=classify(section, title, description), image=image_url(it)))
+                               section=actual_section, image=image_url(it)))
         print(f'{source}: {len(result)} noticias recientes')
         return result
     except Exception as exc:
@@ -135,36 +348,115 @@ def similar(a, b):
     common = len(wa & wb)
     return common >= 3 and common / max(1, min(len(wa), len(wb))) > 0.48
 
+# Agrupar canales del mismo editor evita contar RTVE España y RTVE Cultura
+# como si fueran periódicos diferentes.
+def source_group(source):
+    if source.startswith('RTVE '):
+        return 'RTVE'
+    if source.startswith('El País '):
+        return 'El País'
+    if source.startswith('Europa Press '):
+        return 'Europa Press'
+    if source.startswith('elDiario.es '):
+        return 'elDiario.es'
+    return source
+
+
+def source_priority(source):
+    # Preferencia suave, no veto: el acceso puede variar por artículo.
+    return 1 if source_group(source) in ('El País', 'El Mundo', 'El Confidencial') else 0
+
+
 def choose(items):
-    items.sort(key=lambda x: x['published'], reverse=True)
+    """Diversifica fuentes por sección sin sacrificar frescura ni cupos."""
+    items = sorted(items, key=lambda x: x['published'], reverse=True)
+    cofradias = [it for it in items if it['section'] == 'Cofradías']
+    cofradias.sort(key=lambda it: (bool(HERMANDADES_DESTACADAS.search(it['title'] + ' ' + it['description'])),
+                                   it['published']), reverse=True)
+    special = cofradias[0] if cofradias else None
+    ordinary = [it for it in items if it['section'] != 'Cofradías']
     selected, seen_links = [], set()
-    sources = defaultdict(int)
-    sections = defaultdict(int)
-    def add(it, cap_source):
-        if it['link'] in seen_links or sources[it['source']] >= cap_source:
+    by_source = defaultdict(int)
+    by_section_source = defaultdict(int)
+    by_section = defaultdict(int)
+
+    def add(it, per_section_cap, global_cap):
+        group = source_group(it['source'])
+        key = (it['section'], group)
+        if (len(selected) >= BASE_LIMIT or it['link'] in seen_links
+                or by_section_source[key] >= per_section_cap
+                or by_source[group] >= global_cap):
             return False
         if any(similar(it['title'], old['title']) for old in selected):
             return False
         selected.append(it)
         seen_links.add(it['link'])
-        sources[it['source']] += 1
-        sections[it['section']] += 1
+        by_source[group] += 1
+        by_section_source[key] += 1
+        by_section[it['section']] += 1
         return True
-    # Primera pasada: llenar secciones dentro de sus cupos.
+
+    def balanced_candidates(section=None):
+        candidates = [it for it in ordinary if section is None or it['section'] == section]
+        # Menos representados primero; dentro del mismo nivel, noticias más
+        # recientes y medios normalmente abiertos antes que El País.
+        return sorted(candidates, key=lambda it: (
+            0 if it.get('description') else 1,
+            by_section_source[(it['section'], source_group(it['source']))],
+            by_source[source_group(it['source'])],
+            source_priority(it['source']),
+            # RSS directos suelen incluir imágenes y descripciones más completas.
+            0 if len(it['description']) >= 110 and it['image'] else
+            1 if len(it['description']) >= 110 else
+            2 if it['image'] else 3,
+            -it['published'].timestamp()))
+
+    # Cupos: primera ronda un artículo por fuente y sección, luego segunda, etc.
     for section, quota in QUOTAS.items():
-        for it in items:
-            if sections[section] >= quota:
+        while by_section[section] < quota and len(selected) < BASE_LIMIT:
+            progress = False
+            for it in balanced_candidates(section):
+                if by_section[section] >= quota:
+                    break
+                if add(it, 3, 5 if WEEKEND else 4):
+                    progress = True
+                    break  # Reordenar después de cada elección.
+            if not progress:
                 break
-            if it['section'] == section:
-                add(it, 7 if WEEKEND else 6)
-    # Segunda pasada: redistribuir plazas vacías, sin perder diversidad.
-    for cap in (7 if WEEKEND else 6, LIMIT):
-        for it in items:
-            if len(selected) >= LIMIT:
+
+    # Redistribuir cupos vacíos. Relajar límites solo si faltan noticias.
+    for section_cap, global_cap in ((3, 5 if WEEKEND else 4), (5, 8), (BASE_LIMIT, BASE_LIMIT)):
+        while len(selected) < BASE_LIMIT:
+            progress = False
+            for it in balanced_candidates():
+                if add(it, section_cap, global_cap):
+                    progress = True
+                    break
+            if not progress:
                 break
-            add(it, cap)
-    # Presentación por actualidad, no por orden de selección de las secciones.
-    return sorted(selected[:LIMIT], key=lambda x: x['published'], reverse=True)
+
+    if special:
+        selected.append(special)
+    return sorted(selected, key=lambda x: x['published'], reverse=True)
+
+
+def print_source_report(all_items, chosen):
+    """Diagnóstico visible en el registro de GitHub Actions."""
+    available = defaultdict(int)
+    used = defaultdict(int)
+    for it in all_items:
+        available[(it['section'], source_group(it['source']))] += 1
+    for it in chosen:
+        used[(it['section'], source_group(it['source']))] += 1
+    print('\n=== INFORME DE FUENTES POR SECCIÓN (disponibles -> elegidas) ===')
+    for section in list(QUOTAS) + ['Cofradías']:
+        keys = sorted((key for key in available if key[0] == section),
+                      key=lambda key: (-used[key], -available[key], key[1]))
+        if not keys:
+            print(f'{section}: sin noticias recientes')
+        for key in keys:
+            print(f'  {section} | {key[1]}: {available[key]} -> {used[key]}')
+    print('=== FIN DEL INFORME ===\n')
 
 # Ilustraciones decorativas integradas en el HTML: sin imágenes externas.
 SECTION_ART = {
@@ -175,6 +467,7 @@ SECTION_ART = {
     'Ciencia': ('🔬', 'CIENCIA Y DESCUBRIMIENTOS'),
     'Cultura': ('🎭', 'CULTURA'),
     'Deportes': ('⚽', 'DEPORTES'),
+    'Cofradías': ('⛪', 'COFRADÍAS DE SEVILLA'),
 }
 
 def card(it):
@@ -188,12 +481,12 @@ def card(it):
     img = (f'<img loading="lazy" referrerpolicy="no-referrer" src="{e(it["image"])}" '
            f'alt="Imagen proporcionada por {e(it["source"])}" '
            f'onerror="this.style.display=\'none\'">' if it['image'] else '')
-    excerpt = it['description'] or 'Consulta la noticia completa en el medio de origen.'
+    excerpt = it['description']
     return (f'<article id="noticia-{it.get("story_id", 0)}" class="card"><div class="visual">{fallback}{img}</div><div class="inner">'
             f'<div class="section">{e(it["section"])} · {e(it["source"])}</div>'
             f'<h2><a href="{e(it["link"])}" target="_blank" rel="noopener noreferrer">{e(it["title"])}</a></h2>'
-            f'<p>{e(excerpt)}</p><p class="note">Resumen extraído del RSS del medio; puede ser breve o incompleto. '
-            f'La fotografía, si aparece, procede del feed original. Las ilustraciones son decorativas.</p>'
+            f'{"<p>" + e(excerpt) + "</p>" if excerpt else ""}<p class="note">Texto elaborado a partir de la descripción RSS y, cuando es accesible, la metadescripción del artículo; puede ser breve. '
+            f'La fotografía, si aparece, procede del medio original o de su feed. Las ilustraciones son decorativas.</p>'
             f'<a class="more" href="{e(it["link"])}" target="_blank" rel="noopener noreferrer">Leer noticia original →</a>'
             f'</div></article>')
 
@@ -239,7 +532,7 @@ def weather_block():
                           f'<span class="weather-icon">{icon}</span>'
                           f'<strong>{temp} °C</strong><span>{html.escape(description)}</span>'
                           f'<small>💧 Lluvia: {probability}</small></div>')
-        return ('<section class="weather" aria-label="Previsión meteorológica de Burgos">'
+        return ('<section class="weather" aria-label="Previsión meteorológica de Sevilla">'
                 '<div class="weather-title">EL TIEMPO EN SEVILLA <span>· Previsión de hoy</span></div>'
                 f'<div class="weather-grid">{"".join(blocks)}</div>'
                 '<div class="weather-credit">Fuente: Open-Meteo · Probabilidad de precipitación por hora · '
@@ -255,6 +548,7 @@ SECTION_ORDER = [
     ('España', 'España', 'espana'),
     ('Internacional', 'Mundo', 'mundo'),
     ('Local', 'Sevilla', 'sevilla'),
+    ('Cofradías', 'Cofradías', 'cofradias'),
     ('Sociedad', 'Sociedad', 'sociedad'),
     ('Deportes', 'Deportes', 'deportes'),
     ('Cultura', 'Cultura', 'cultura'),
@@ -319,7 +613,8 @@ def sections_html(chosen, lead):
     """Agrupa las noticias por sección y crea destinos para el menú."""
     output = []
     for section, label, anchor in SECTION_ORDER:
-        articles = [item for item in chosen if item['section'] == section and item is not lead]
+        articles = [item for item in chosen if item['section'] == section and
+                    (item is not lead or section == 'Cofradías')]
         if not articles:
             continue
         output.append(f'<section class="news-section" id="{anchor}" aria-labelledby="heading-{anchor}">'
@@ -340,9 +635,14 @@ def main():
     items = []
     for feed in FEEDS:
         items.extend(fetch(*feed))
-    chosen = choose(items)
+    evaluated = quality_enrich(items)
+    chosen = choose(evaluated)
+    print_source_report(evaluated, chosen)
+    useful = sum(bool(it['description']) for it in chosen)
+    photos = sum(bool(it['image']) for it in chosen)
+    print(f'=== CALIDAD EDITORIAL FINAL === Resúmenes útiles: {useful}/{len(chosen)}; fotos: {photos}/{len(chosen)}')
     if len(chosen) < 5:
-        raise SystemExit('Menos de cinco noticias recientes disponibles: se conserva la edición anterior.')
+        raise SystemExit('Menos de cinco noticias con resumen útil: se conserva la edición anterior.')
     date = NOW.strftime('%d/%m/%Y')
     for i, item in enumerate(chosen):
         item['story_id'] = i + 1
@@ -360,14 +660,14 @@ def main():
  .news-nav{{position:sticky;top:0;z-index:20;background:#fff;border-bottom:2px solid #252525;box-shadow:0 2px 8px #00000012;font-family:Arial,sans-serif}}.nav-inner{{max-width:1320px;margin:auto;display:flex;gap:4px;align-items:center;overflow-x:auto;white-space:nowrap;padding:0 12px;scrollbar-width:thin}}.news-nav a{{display:inline-block;padding:14px 13px;text-decoration:none;color:#222;font-size:13px;font-weight:700}}.news-nav a:hover,.news-nav a:focus-visible{{background:#eee9df;color:#1b6177}}.news-section{{margin:24px 0 42px;scroll-margin-top:74px}}.section-heading{{display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:3px solid #262626;border-bottom:1px solid #bbb;margin:0 0 20px;padding:9px 0}}.section-heading h2{{font:700 clamp(23px,3vw,31px) Georgia,serif;margin:0}}.back-top{{font:12px Arial,sans-serif;color:#31677a;text-decoration:none}}@media(max-width:640px){{.news-nav a{{padding:12px 10px;font-size:12px}}.news-section{{margin-bottom:32px}}}}
  .weather{{max-width:850px;margin:16px auto 0;padding:13px 18px;border:1px solid #ded9cf;border-radius:9px;background:#f7f5ef;font-family:Arial,sans-serif;text-align:center}}.weather-title{{font-size:12px;letter-spacing:1.4px;font-weight:700;color:#31586a}}.weather-title span{{font-weight:400;letter-spacing:0;color:#777}}.weather-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:12px 0}}.weather-time{{display:flex;flex-direction:column;align-items:center;gap:5px;border-right:1px solid #ddd;font-size:12px;color:#555}}.weather-time:last-child{{border-right:0}}.weather-hour{{font-weight:700}}.weather-icon{{font-size:24px}}.weather-time strong{{font-size:19px;color:#222}}.weather-time small{{font-size:11px}}.weather-credit{{font-size:10px;color:#777}}.weather-unavailable{{font-size:12px}}@media(max-width:640px){{.weather{{padding:11px 6px}}.weather-time strong{{font-size:17px}}.weather-time small{{font-size:10px}}}}
  .cover{{scroll-margin-top:74px;margin-bottom:35px}}.cover-heading{{font:700 30px Georgia,serif;border-bottom:3px solid #222;padding-bottom:12px;margin:0 0 20px}}.cover-lead{{display:grid;grid-template-columns:1.05fr 1fr;background:#fff;border:1px solid #dcd7cd}}.cover-image{{position:relative;min-height:340px;overflow:hidden;background:#e6e0d5}}.cover-image img{{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}}.cover-copy{{padding:28px}}.cover-label{{font:700 12px Arial,sans-serif;letter-spacing:1px;color:#a0392f}}.cover-copy h2{{font-size:clamp(26px,3.2vw,42px);line-height:1.12;margin:14px 0}}.cover-copy p{{font:17px/1.55 Georgia,serif}}.cover-source{{display:inline-block;font:12px Arial,sans-serif;color:#666;margin-bottom:15px}}.cover-subtitle{{font:700 21px Georgia,serif;margin:25px 0 13px}}.cover-teasers{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}}.cover-teaser{{display:flex;flex-direction:column;gap:10px;text-decoration:none;color:#222;border-top:3px solid #333;background:#fff;padding:18px;min-width:0}}.cover-teaser span{{font:700 11px Arial,sans-serif;color:#2e6a80;text-transform:uppercase}}.cover-teaser strong{{font:700 19px/1.2 Georgia,serif}}.cover-teaser small{{margin-top:auto;font:12px Arial,sans-serif;color:#226079}}@media(max-width:760px){{.cover-lead{{grid-template-columns:1fr}}.cover-image{{min-height:230px}}.cover-copy{{padding:20px}}.cover-teasers{{grid-template-columns:1fr}}}}
-</style></head><body><header id="portada"><div class="tag">Tu periódico · {edition}</div><h1>El café de la actualidad</h1><p>{date} · Sevilla · Noticias seleccionadas de medios abiertos</p>{forecast_html}</header>{navigation}<main><p class="intro"><b>Actualidad para conversar.</b> Selección automática de noticias recientes de canales RSS. Los textos proceden de las descripciones facilitadas por los medios: no son crónicas redactadas ni verificadas de forma independiente. Pulsa cada titular para conocer los detalles.</p>{cover}{body}</main><footer>Edición automática gratuita · Enlaces y derechos de las noticias y fotografías pertenecen a sus respectivos medios · Última generación: {NOW.strftime('%d/%m/%Y %H:%M')} (hora peninsular)</footer></body></html>'''
+</style></head><body><header id="portada"><div class="tag">Tu periódico · {edition}</div><h1>El café de la actualidad</h1><p>{date} · Sevilla · Noticias seleccionadas de medios abiertos</p>{forecast_html}</header>{navigation}<main><p class="intro"><b>Actualidad para conversar.</b> Selección automática de noticias recientes de canales RSS. Los textos se elaboran a partir de descripciones RSS y metadescripciones públicas: pueden ser breves y no están verificados de forma independiente. Pulsa cada titular para conocer los detalles.</p>{cover}{body}</main><footer>Edición automática gratuita · Enlaces y derechos de las noticias y fotografías pertenecen a sus respectivos medios · Última generación: {NOW.strftime('%d/%m/%Y %H:%M')} (hora peninsular)</footer></body></html>'''
     # Guion de voz en el orden visual: portada y después secciones.
     spoken = [lead] + [it for section, _, _ in SECTION_ORDER for it in chosen
                         if it['section'] == section and it is not lead]
     chunks = ['Bienvenidos a El café de la actualidad, edición Sevilla. Estas son las noticias del día.']
     for index, item in enumerate(spoken, 1):
         chunks.append(f'Noticia {index}. {item["section"]}. {item["title"]}. '
-                      + (item['description'] or 'Consulta el medio original para ampliar esta noticia.'))
+                      + (item['description'] or ''))
     chunks.append('Hasta aquí El café de la actualidad. Gracias por escucharnos.')
     with open('guion_audio.txt', 'w', encoding='utf-8') as f:
         f.write('\n\n'.join(chunks))
